@@ -1,6 +1,6 @@
 # Machine-learning-identifies-robust-matrisome-markers-and-regulatory-mechanisms-in-cancer
 
-https://doi.org/10.5281/zenodo.4134099
+https://zenodo.org/badge/DOI/10.5281/zenodo.4134099.svg
 
 This repository contains the code (in R language) that was used to generate all the analyses presented in the manuscript “Machine learning identifies robust matrisome markers and regulatory mechanisms in cancer” by Anni Kääriäinen, Vilma Pesola, Annalena Dittmann, Juho Kontio, Jarkko Koivunen, Taina Pihlajaniemi and Valerio Izzi.
 
