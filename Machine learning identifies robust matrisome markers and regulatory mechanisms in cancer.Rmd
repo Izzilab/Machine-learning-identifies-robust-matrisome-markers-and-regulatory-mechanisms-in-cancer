@@ -1,0 +1,1861 @@
+---
+title: Machine learning identifies robust matrisome markers and regulatory mechanisms in cancer
+self_contained: yes
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+FOREWORD
+
+This notebook contains the whole code necessary to regenerate our findings and conclusions, and is provided "as it is" for re-use and re-discovery. None of the contributors is a professional programmer, so the code is slow, intricate and (in parts) unpleasant to look and to execute. It is also a dynamic entity, built by the Authors while they themselves were learning more and more about coding, so the way the same job is executed in different parts of the code may vary largely. We cannot guarantee that its execution will not stuck your PC or, in the worst case, permanently damage it. By running any part of this code you accept this risk.
+
+There are two important notes before moving on the the actual code:
+
+1) graphs and tables might have been post-produced manually for publication, so their appearance might differ from what is generated executing the chunks below. Nevertheless, no content is changed in its substance.
+
+2) executing the whole code requires A LOT of libraries pre-installed. We do not provide any command to install them and, thus, advise those who want to re-execute these commands to check for the libraries needed in the various chunks before running any part of the code.
+
+3) as a default, we do not automatically save graphs but export tables automatically. Users are free to decide which graph they want.
+
+# STEP 0: SETUP WORKING DIRECTORIES
+
+```{r eval = F}
+
+setwd(" ") # change to need
+dir.data <- getwd()
+dir.create("RESULTS")
+setwd(paste(dir.data,"/RESULTS",sep=""))
+dir.res <- getwd()
+setwd(dir.data)
+
+library(dplyr)
+library(data.table)
+
+```
+
+# STEP 1: INITIAL DATA SETUP
+
+This section generates the RDS object that contains all data for analysis. These steps are left for transparency but users should start from #2.
+
+Form a clinical annotation data frame with relevant parameters. This will be eventually subsetted to account for samples with missing information, etc. and to reduce the other data layers to a common set of samples.
+
+```{r eval = F}
+
+clin1 <- fread("TCGAclindata_sampletype.txt", header=T, sep="\t")
+clin1 <- as.data.frame(clin1)
+clin1 <- clin1[!clin1$sample_type == "Solid Tissue Normal",]
+m1 <- clin1$sample
+clin2 <- fread("TCGAclindata.txt", header=T, sep="\t")
+clin2 <- as.data.frame(clin2)
+m2 <- clin2$sample
+m <- intersect(m1,m2)
+clin2 <- subset(clin2, clin2$sample %in% m)
+clin3 <- fread("TCGASubtype.20170308.txt", header=T, sep="\t", fill=T)
+clin3 <- as.data.frame(clin3)
+clin3 <- subset(clin3, clin3$sample %in% m)
+m <- clin3$sampleID
+clin2 <- subset(clin2, clin2$sample %in% m)
+names(clin3)[1] <- "sample"
+fin.clin <- merge(clin2,clin3[,c(1,9)],by="sample")
+
+```
+
+Load and subset gene programs.
+
+```{r eval = F}
+
+tab <- fread("gene_programs.txt", header = T, sep="\t")
+tab <- as.data.frame(tab)
+tab$X <- NULL
+gp <- subset(tab, tab$sample %in% m)
+fin.clin <- subset(fin.clin, fin.clin$sample %in% gp$sample)
+gp <- subset(gp, !duplicated(gp$sample))
+
+```
+
+Load and subset CNAs and mutations. These will be double-subsetted to samples with clinical data available and the matrisome. Mutations are also further filtered to remove silent mutations.
+
+```{r eval = F}
+
+gis <- fread("Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.txt", header=T, sep="\t") 
+mut <- fread("mc3.v0.2.8.PUBLIC.xena.txt", header=T, sep="\t")
+gis <- as.data.frame(gis)
+mut <- as.data.frame(mut)
+
+rownames(gis) <- gis[,1] #manipulate GIS file to format as the other files#
+gis[,1] <- NULL
+gis <- as.data.frame(t(gis))
+gis$sample <- as.character(rownames(gis))
+rownames(gis) <- NULL
+gis <- gis[,c(24777,2:24776)]
+gis$sample <- gsub("\\.", "-", gis$sample)
+gis <- subset(gis, gis$sample %in% gp$sample)
+fin.clin <- subset(fin.clin, fin.clin$sample %in% gis$sample)
+gp <- subset(gp, gp$sample %in% gis$sample)
+
+mut <- subset(mut, mut$sample %in% gis$sample)
+
+mn <- read.table("matrisome_hs.txt", header=T, sep="\t") #cut to matrisome genes#
+mn <- mn$Gene.Symbol
+mn <- as.character(mn)
+rownames(gis) <- gis[,1]
+gis[,1] <- NULL
+gis <- gis[,colnames(gis) %in% mn]
+gis$sample <- rownames(gis)
+rownames(gis) <- NULL
+gis <- gis[,c(1015,1:1014)]
+mut <- mut[mut$gene %in% mn,]
+mut <- subset(mut, !mut$effect == "Silent")
+
+```
+
+Load and subset miRNAs. These will be double-subsetted to samples with clinical data available and the matrisome as target. miRNA-mRNA interactions are taken from http://mirtarbase.mbc.nctu.edu.tw/php/download.php and subsetted to remove weak entries.
+
+```{r eval = F}
+
+mirna <- fread("miRNAs.txt", header = T, sep="\t")
+mints <- fread("hsa_MTI.txt", header = T, sep="\t")
+mints <- as.data.frame(mints)
+mints <- subset(mints, !mints$`Support Type` == "Functional MTI (Weak)")
+mints <- subset(mints, mints$`Target Gene` %in% mn)
+mirna <- subset(mirna, mirna$sample %in% mints$miRNA)
+mirna <- as.data.frame(mirna)
+rownames(mirna) <- mirna[,1]
+mirna[,1] <- NULL
+mirna <- as.data.frame(t(mirna))
+mirna$sample <- rownames(mirna)
+mirna <- mirna[,c(251,1:250)]
+rownames(mirna) <- NULL
+mirna$sample <- gsub("\\.", "-", mirna$sample)
+mirna <- subset(mirna, mirna$sample %in% gp$sample)
+
+#back-subsetting the other data we collected so far would drop GBM entirely (+ some samples from other tumors), which we wish to retain. So, we keep it and insert 0s in our miRNA frame. GBM, later on, will not model miRNA effects#
+
+add <- data.frame(sample=fin.clin$sample[!fin.clin$sample %in% mirna$sample], matrix(0,218,250))
+names(add)[2:ncol(add)] <- names(mirna[2:ncol(mirna)])
+mirna <- bind_rows(mirna,add)
+
+```
+
+Load and subset purity data. The immune/stroma fraction is calculated as 1-purity, whose measure is CPE (consensus from other methods). Data are from https://www.nature.com/articles/ncomms9971/ .
+
+```{r eval = F}
+
+library(TCGAbiolinks)
+pur <- Tumor.purity
+names(pur)[1] <- "sample"
+pur$sample <- gsub('.{1}$', '', pur$sample)
+pur <- subset(pur, pur$sample %in% gp$sample)
+pur$CPE <- gsub(",",".",pur$CPE)
+pur$CPE <- as.numeric(pur$CPE)
+pur <- pur[,c(1,7)]
+pur$st.fraction <- 1-pur$CPE
+pur <- subset(pur,!duplicated(pur$sample))
+
+#back-subsetting the other data we collected so far would drop ESCA, STAD, LAML and PCPG entirely, which we wish to retain. So, we keep them and insert 1s in our purity frame. ESCA, STAD, LAML and PCPG, later on, will not model miRNA effects#
+
+add <- data.frame(sample=fin.clin$sample[!fin.clin$sample %in% pur$sample], matrix(0,876,2))
+names(add)[2:3] <- names(pur)[2:3]
+pur <- bind_rows(pur,add)
+
+```
+
+Load and subset matrisome gene expression data.
+
+```{r eval = F}
+
+p1 <- read.table("panc1.txt", header=T, sep="\t")
+p2 <- read.table("panc2.txt", header=T, sep="\t")
+p3 <- read.table("panc3.txt", header=T, sep="\t")
+p4 <- read.table("panc4.txt", header=T, sep="\t")
+m <- merge(p1, p2, by="sample")
+m <- merge(m, p3, by="sample")
+m <- merge(m, p4, by="sample")
+m <- subset(m, m$sample %in% gp$sample)
+matrisome.expr <- m
+m <- NULL
+
+mn <- read.table("matrisome_hs.txt", header=T, sep="\t") #cut to matrisome genes#
+
+```
+
+Load and subset transcription factor (TF) data.
+
+```{r eval = F}
+
+library(tftargets)
+
+res <- list()
+for(i in 1:length(TRRUST)){
+  z <- TRRUST[[i]]
+  df <- data.frame(TF=names(TRRUST)[i], target=z)
+  res[[i]] <- df
+}
+tr <- bind_rows(res)
+res <- list()
+for(i in 1:length(Marbach2016)){
+  z <- Marbach2016[[i]]
+  df <- data.frame(TF=names(Marbach2016)[i], target=z)
+  res[[i]] <- df
+}
+mar <- bind_rows(res)
+tf <- bind_rows(tr,mar)
+tf <- unique(tf)
+tf <- subset(tf, tf$target %in% mn$Gene.Symbol)
+
+dat <- fread("EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.txt", header=T, sep="\t")
+dat <- subset(dat, dat$sample %in% unique(tf$TF))
+dat <- as.data.frame(dat)
+rownames(dat) <- dat[,1]
+dat[,1] <- NULL
+dat <- as.data.frame(t(dat))
+dat$sample <- rownames(dat)
+dat <- dat[,c(744,1:743)]
+rownames(dat) <- NULL
+dat$sample <- gsub("\\.", "-",dat$sample)
+dat <- subset(dat, dat$sample %in% gp$sample)
+
+```
+
+Load and subset Illumina Methyl450 data. These will be double-subsetted to samples with clinical data available and the matrisome as target. Data are mean of probes throughout the gene.
+
+```{r eval = F}
+
+m1 <- fread("met1.txt", header=T, sep="\t")
+m2 <- fread("met2.txt", header=T, sep="\t")
+m3 <- fread("met3.txt", header=T, sep="\t")
+m4 <- fread("met4.txt", header=T, sep="\t")
+m5 <- fread("met5.txt", header=T, sep="\t")
+m6 <- fread("met6.txt", header=T, sep="\t")
+m7 <- fread("met7.txt", header=T, sep="\t")
+m8 <- fread("met8.txt", header=T, sep="\t")
+m9 <- fread("met9.txt", header=T, sep="\t")
+m <- merge(m1,m2,by="sample")
+m <- merge(m,m3,by="sample")
+m <- merge(m,m4,by="sample")
+m <- merge(m,m5,by="sample")
+m <- merge(m,m6,by="sample")
+m <- merge(m,m7,by="sample")
+m <- merge(m,m8,by="sample")
+m <- merge(m,m9,by="sample")
+m <- m[na.omit(m)]
+met <- subset(m, m$sample %in% gp$sample)
+
+#back-subsetting the other data we collected so far would drop PCPG entirely, which we wish to retain. So, we keep it and insert 0s in our methylation frame. This will not alter modelling methylation in PCPG later on as we would have imputed 0s in the final binder#
+
+add <- data.frame(sample=fin.clin$sample[!fin.clin$sample %in% met$sample], matrix(0,2640,2052))
+names(add)[2:ncol(add)] <- names(met)[2:ncol(met)]
+met <- bind_rows(met,add)
+
+```
+
+Dump data into a final RDS object. This now has 9 data layers (clinical, mutations, CNAs, gene programs, miRNAs, purity, matrisome gene expression, TF gene expression and methylation) and 3 vocabularies (miRNA targets, TF targets and matrisome genes & categories).
+
+```{r eval = F}
+
+l <- list(clinical.data=fin.clin, mutation.data=mut, cna.data=gis, gp.data=gp, mirna.data=mirna, mirna.vocabulary=mints, tumor.purity=pur, matrisome.vocabulary = mn, matrisome.data=matrisome.expr, tf.vocabulary=tf, tf.data=dat, methylation.data=met)
+saveRDS(l, "data dump.rds")
+rm(list=ls())
+gc()
+
+```
+
+# STEP 2: IDENTIFY TRANSCRIPTIONAL LANDMARKS OF TUMOR MATRISOME
+
+At first, we try to address the question whether matrisome expression is, overall, affected by the molecular/clinical subtype of the different tumors. Visual inspection of results from t-SNE (Tsne parameters are taken from https://www.nature.com/articles/s41467-019-13056-x#Sec2) and Spearman correlation suggest that each tumor is a cluster per se, negating that molecular differences in subtypes have an impact on the tumor matrisome. The only deviation from this rule is in the neuroendocrine cluster, where also KICH, one subtype of THCA and one of UCS are found. Notably, their correlation is much higher with PCPG and ACC than with GBM-LGG, suggesting more commonalities in "peripheral nervous system-like" tumor matrisomes.
+The dominant factors in shaping the tumor matrisome seem to be the cell- and tissue-of-origin, pulling tumors that share a common physiopathological identity (see, e.g., squamous and neuroendocrine tumors) together and suggesting a major structure with 5 matrisome "types" separating blood, liver, neuroendocrine, squamous and adenomatous/sarcomatous tumors - the latter 3 further subdivided into their single constituents. The same conclusions can be drawn from mixed gaussian model (MGM) clustering and UMAP-augmented density-based clustering (DBSCAN).
+
+```{r eval = F}
+
+data <- readRDS("data dump.rds")
+tr1 <- as.data.frame(table(data$clinical.data$Subtype_Selected))
+tr1 <- tr1[tr1$Freq >= 10,] #removes 6 tumor subtypes and 44 samples#
+
+sel <- subset(data$clinical.data, data$clinical.data$Subtype_Selected %in% tr1$Var1)
+sel <- sel[,c(1,3,35)]
+m <- subset(data$matrisome.data, data$matrisome.data$sample %in% sel$sample)
+m <- merge(sel,m,by="sample")
+m[,1] <- NULL
+m[is.na(m)] <- 0
+
+library(Rtsne)
+
+m2 <- normalize_input(as.matrix(m[,3:ncol(m)]))
+
+#visualization with t-SNE#
+
+set.seed(123)
+rt <- Rtsne(m2, pca_center = F, perplexity = 663, eta = 553) 
+d <- data.frame(labels=m[,2],tum.type=m[,1],x=rt$Y[,1],y=rt$Y[,2])
+
+d$histo.type <- ifelse(d$tum.type == "OV","Gyn",
+                ifelse(d$tum.type == "UCEC", "Gyn",
+                ifelse(d$tum.type == "UCS", "Gyn",
+                ifelse(d$tum.type == "GBM", "Neuroendocrine",
+                ifelse(d$tum.type == "LGG", "Neuroendocrine",
+                ifelse(d$tum.type == "PCPG","Neuroendocrine",
+                ifelse(d$tum.type == "ACC", "Neuroendocrine",
+                ifelse(d$tum.type == "COAD", "Gi",
+                ifelse(d$tum.type == "READ", "Gi",
+                ifelse(d$tum.type == "STAD", "Gi-associated",
+                ifelse(d$tum.type == "LIHC", "Gi-associated",
+                ifelse(d$tum.type == "ESCA", "Squamous",
+                ifelse(d$tum.type == "HNSC", "Squamous",
+                ifelse(d$tum.type == "LUSC", "Squamous",
+                ifelse(d$tum.type == "LAML", "Blood",
+                ifelse(d$tum.type == "KICH", "Renal",
+                ifelse(d$tum.type == "KIRC", "Renal",
+                ifelse(d$tum.type == "KIRP", "Renal",
+                       "other"))))))))))))))))))
+
+library(ggplot2)
+#global graph - option is given to add a shape code for the cell/tissue-of-orign patterns#
+ggplot(data = d, aes(x,y)) + geom_point(aes(colour = labels #,
+    #shape = histo.type
+    ), size = 1) + 
+    #scale_shape_manual(values=as.factor(d$histo.type)) +
+    theme_void() #+ facet_wrap(~labels)
+
+#major tumor types#
+ggplot(data = d, aes(x,y)) + geom_point(aes(colour = tum.type), size = 1) + 
+    theme_void() #+ facet_wrap(~tum.type)
+
+#cell/tissue-of-origin patterns#
+ggplot(data = d, aes(x,y) ) + geom_point(aes(colour = histo.type), size = 1) + 
+    theme_bw() #+ facet_wrap(~tum.type)
+
+#correlation table and plot#
+
+res <- aggregate(m[,c(3:ncol(m))], by=list(m$Subtype_Selected), mean)
+rownames(res) <- res[,1]
+res[,1] <- NULL
+res <- t(res)
+res <- as.matrix(res)
+res <- cor(res, method = "spearman")
+library(pheatmap)
+out <- pheatmap(res, fontsize = 5, cutree_rows = 5, cutree_cols = 5)
+
+#unsupervised clustering by gaussian mixture modelling#
+
+library(mclust)
+m2 <- as.data.frame(m2)
+res <- list()
+set.seed(123)
+for(i in 1:10){
+  z <- m2[sample(nrow(m2), 660), ]
+  bic <- mclustBIC(z, G=c(2:20))
+  mod1 <- Mclust(z, x = bic)
+  res[[i]] <- data.frame(iteration=i, N.of.components=mod1$G)
+}
+res <- bind_rows(res)
+n <- round(mean(res[,2]),0)
+k <- kmeans(m2, n)
+df <- data.frame(tum.type=m$Subtype_Selected, cl=k$cluster)
+
+library(corrplot)
+library(RColorBrewer)
+corrplot(cor(t(table(df$tum.type,df$cl))), tl.cex = 0.3, tl.col = "black", col = c("blue","white","red"))
+
+#density-based clustering, using UMAP to increase performance of DBSCAN#
+
+library(umap)
+library(dbscan)
+
+clustembed <- umap(m2,
+    n_neighbors=30,
+    min_dist=0.01,
+    n_components=10,
+    random_state=42)
+
+plot(density(table(df$tum.type))) #density of tumor subtype sizes
+abline(v=30, col=c("red"))
+
+dbs <- hdbscan(clustembed$layout, minPts = 60) #at least twice the theoretical size of the average tumor type. Smaller values, closer to real distribution, give N clusters ) N tumor types#
+
+df <- data.frame(tum.type=m$Subtype_Selected, cl=dbs$cluster)
+
+corrplot(cor(t(table(df$tum.type,df$cl))), tl.cex = 0.3, tl.col = "black", col = c("blue","white","red"))
+
+```
+
+Based on the results above, we next try to identify genes that best represent the tumors in these clusters, following the idea that tumors in the same cluster should share at least some of them. To this this hypothesis we use a 4-stage procedure as follows:
+
+Stage 1: Mann-Whitney U (MWU) test for gene expression, with FDR-correction. Each tumor subtype is tested against all other, except for those in the same cluster. Clusters have been loosely defined in the step above: LAML, LIHC, Neuroendocrine, Squamous and Adenomatous/Sarcomatous (rest). For the latter, since tumor types within show practically no correlation with each other, no cluster exclusion is performed.
+
+```{r eval = F}
+
+ndf <- data.frame(m[,c(1,2)], m2)
+cn <- colnames(res[,out$tree_col[["order"]]])
+ann <- data.frame(tum.type=cn, cl=c(
+  rep(1,7),
+  rep(2,3),
+  rep(3,19),
+  rep(4,60)))
+ndf <- merge(ann,ndf,by.x="tum.type",by.y="Subtype_Selected")
+
+res <- list()
+res2 <- list()
+for(i in unique(ndf$tum.type)){
+  print(paste0("testing ",i))
+  z1 <- subset(ndf, ndf$tum.type == i)
+  z2 <- subset(ndf, !ndf$tum.type == i)
+  z2 <- if(unique(z1$cl == 4)){z2 <- z2}else
+  {subset(z2, !z2$cl %in% z1$cl)}
+  z1 <- z1[,c(4:ncol(z1))]
+  z2 <- z2[,c(4:ncol(z2))]
+  for(q in 1:ncol(z1)){
+    print(paste0(i," ***testing ",names(z1)[q]))
+    x <- z1[,q]
+    y <- z2[,q]
+    w <- wilcox.test(x,y)
+    fc <- sign(mean(x)/mean(y))*log2(abs(mean(x)/mean(y)))
+    w <- data.frame(gene=names(z1)[q], tumor.type=i, FC=fc, side=ifelse(mean(x)>mean(y),"increased","decreased"),pval=w$p.value)
+    res[[q]] <- w
+  }
+  res2[[i]] <- bind_rows(res)
+}
+res2 <- bind_rows(res2)
+res2$adj.pval <- p.adjust(res2$pval, "fdr")
+res2 <- na.omit(res2)
+res2 <- subset(res2,res2$adj.pval < 0.05 & res2$side == "increased")
+nd <- d[,c(1,5)]
+nr <- merge(nd,res2,by.x="labels", by.y = "tumor.type")
+nr <- unique(nr)
+
+setwd(dir.res)
+fwrite(nr, "step2_MWU test_all genes.txt", row.names = F, quote = F)
+setwd(dir.data)
+#setwd(dir.res)
+#nr <- fread("step2_MWU test_all genes.txt", header=T, quote = F) #if restarting#
+#nr <- as.data.frame(nr)
+#setwd(dir.data)
+
+```
+
+Stage 2: weighted gene coexpression networks (WGCNA) for the same tumor subtypes.
+
+```{r eval = F}
+
+#programmatic WGCNA#
+
+ndf <- data.frame(m[,c(1,2)], m2)
+
+library(WGCNA)
+res <- list()
+ct <- 0
+l <- length(unique(nr$labels))
+for(i in unique(nr$labels)){
+  ct <- ct+1
+
+  s <- subset(nr, nr$labels == i)
+  s1 <- subset(ndf, ndf$Subtype_Selected %in% s$labels)
+  
+  print(paste0(ct, " of ", l, " : calculating WGCN"))
+
+  #1 correlation network
+  
+  cm <- s1[,c(3:ncol(s1))]
+  cm[is.na(cm)] <- 0
+  cm <- cm[, colSums(cm != 0) > 0]
+  cm <- cm[vapply(cm, function(x) length(unique(x)) > 1, logical(1L))]
+  cm <- cor(cm, method="spearman")
+  
+  #adjacency matrix
+  
+  a <- 0.5+(0.5*cm)
+  
+  print("finding and testing beta values")
+  beta <- pickSoftThreshold(
+  s1[, c(3:ncol(s1))], 
+  dataIsExpr = TRUE,
+  weights = NULL,
+  RsquaredCut = 0.85, 
+  powerVector = c(seq(1, 10, by = 1), seq(12, 20, by = 2)), 
+  removeFirst = FALSE, nBreaks = 10, blockSize = NULL, 
+  corFnc = cor, corOptions = list(use = 'p'), 
+  networkType = "unsigned",
+  moreNetworkConcepts = FALSE,
+  gcInterval = NULL,
+  verbose = 0, indent = 0)
+  
+  beta <- beta$powerEstimate
+  
+  beta2 <- ifelse(min(cm^beta)==0,beta,ifelse(min(cm^(beta+1))==0,beta+1,
+            ifelse(min(cm^(beta+2))==0,beta+2,12)))
+  
+  a <- cm^beta2
+  
+  #topological measure and  module construction
+  tom <- GTOMdist(a, degree = 1)
+  hc <- hclust(as.dist(tom), method = "average")
+  cls <- cutreeDynamic(hc, minClusterSize = 10, distM = as.matrix(as.dist(tom)))
+  cls <- data.frame(gene=rownames(cm), cluster.assignment=cls)
+  cls <- subset(cls, cls$cluster.assignment > 0)
+  if(nrow(cls) > 0){df <- cls}else{df <- data.frame(gene="none",cluster.assignment=0)
+  print("no modules detected! Moving on to next iteration")}
+  df$tumor.type <- i
+  res[[i]] <- df
+}
+res <- bind_rows(res)
+
+setwd(dir.res)
+fwrite(res, "step2_WGCNA test_all genes.txt", row.names = F, quote = F)
+setwd(dir.data)
+#setwd(dir.res)
+#res <- fread("step2_WGCNA test_all genes.txt", header=T, quote = F) #if restarting#
+#res <- as.data.frame(res)
+#setwd(dir.data)
+
+```
+
+Stage 3: pruning results via adaptive lasso (10X CV) regression. Variables are defined by the comparison of MWU e WGCNA and tested against a logistic class assignment (1/0) based on the tumor subtype.
+
+```{r eval = F}
+
+fin <- list()
+library(parallel)
+library(snow)
+library(foreach)
+library(doSNOW)
+cores <- detectCores()
+cl <- makeCluster(cores-1)
+registerDoSNOW(cl)
+library(glmnet)
+
+for(i in unique(res$tumor.type)){
+  z <- subset(nr, nr$labels == i)
+  z2 <- subset(res, res$tumor.type == i)
+  n <- intersect(z$gene,z2$gene)
+
+  #module regression
+  if(length(n)==0){df2 <- data.frame(gene="none",coef=0,tumor=i)
+  print("   ***  no common variables from MWU-WGCNA. Skipping calculations!")}else{
+    print(paste0(i," : regressing ", length(n), " genes against class assignment"))
+  subz <- subset(ndf, select=colnames(ndf)%in%n)
+  if(ncol(subz)<=3){df2 <- data.frame(gene="none",coef=0,tumor=i)
+  print("   *** not enough variables. Skipping calculations!")}else{
+  subz$target <- ifelse(ndf$Subtype_Selected == i,1,0)
+  subz <- subz[,c(ncol(subz),1:(ncol(subz)-1))]
+  subz[is.na(subz)] <- 0
+  print("   *** 10X ridge regression")
+  ridge_cv <- cv.glmnet(x = as.matrix(subz[,2:ncol(subz)]), y = subz[,1],
+                     type.measure = "deviance",
+                     nfold = 10,
+                     family = "binomial",
+                     alpha = 0,
+                     parallel = T)
+  bc <- coef(ridge_cv, s = ridge_cv$lambda.min)
+  bc <- as.numeric(bc)[-1]
+  print("   *** 10X adaptive lasso regression")
+  alasso_cv <- cv.glmnet(x = as.matrix(subz[,2:ncol(subz)]), y = subz[,1],
+                   type.measure = "deviance",
+                   nfold = 10,
+                   family = "binomial",
+                   alpha = 1,
+                   penalty.factor = 1 / abs(bc),
+                   keep = TRUE,
+                   parallel = T)
+  al <- coef(alasso_cv, s = alasso_cv$lambda.min)
+  al <- data.frame(gene=rownames(al)[2:nrow(al)],coef=al[2:nrow(al),1])
+  al <- subset(al, al$coef > 0)
+  if(nrow(al)==0){df2 <- data.frame(gene="none",coef=0,tumor=i)
+  print("   *** no regressors found!")}else{
+  print("   *** writing results")
+  df2 <- data.frame(al, tumor=i)
+  }
+  }}
+  fin[[i]] <- df2
+}
+fin <- bind_rows(fin)
+stopCluster(cl)
+fin <- subset(fin,!fin$gene == "none") #computation possible for 87/89 tumor subtypes#
+#barplot(table(fin$tumor),las=2, col = rainbow(length(unique(fin$tumor)))) #visualization, if desired#
+
+setwd(dir.res)
+fwrite(fin, "step2_AdaLASSO_significant genes.txt", row.names = F, quote = F)
+setwd(dir.data)
+#setwd(dir.res)
+#fin <- fread("step2_AdaLASSO_significant genes.txt", header=T, quote = F) #if restarting#
+#fin <- as.data.frame(fin)
+#setwd(dir.data)
+
+
+```
+
+Stage 4: finally, the expression of each matrisome gene is fitted into a bimodal distribution via expectation maximization (EM) of mixtures of univariate normals, genes are selected and allocated to each tumor type if their expression is equal or bigger than the mean + 2SD of the total, and DEGs and EMs are confronted. Only genes common to the both lists, per tumor type, are kept. With this final step, the total of DEGs that represent our data is 724 (316 unique).
+
+```{r eval = F}
+
+l <- list() #overall pheatmap/tSNE with DEGS. All tumors are well separated#
+for(i in unique(fin$tumor)){
+  z <- subset(fin, fin$tumor == i)
+  z$coef <- 1
+  z2 <- data.frame(tumor=i,t(z$coef))
+  colnames(z2)[2:ncol(z2)] <- z$gene
+  l[[i]] <- z2
+}
+l <- bind_rows(l)
+l[is.na(l)] <- 0
+rownames(l) <- l[,1]
+l[,1] <- NULL
+pheatmap(l, breaks = c(-1,0,1), color = c("white","red"), fontsize = 5)
+l2 <- t(l)
+l2 <- cor(l2)
+pheatmap(l2, breaks = c(-1,0.2,1), color = c("white","red"), fontsize = 5)
+
+nn <- merge(fin,ndf[,1:3],by.x="tumor",by.y="tum.type")
+nn <- unique(nn)
+
+tab <- ndf[, colnames(ndf) %in% unique(nn$gene)]
+rt <- Rtsne(tab, pca_center = F, perplexity = 663, eta = 553) 
+d <- data.frame(labels=m[,1],tum.type=m[,2],x=rt$Y[,1],y=rt$Y[,2])
+
+library(ggplot2)
+library(ggsci)
+ggplot(data = d, aes(x,y)) + geom_point(aes(colour = as.factor(labels)), size = 1) + theme_void()
+
+cms <- list() #colMeans per tumor type - to briefly check distributions#
+for(i in unique(fin$tumor)){
+  z <- subset(ndf, ndf$Subtype_Selected == i)
+  z2 <- colMeans(z[,c(3:ncol(z))])
+  z2 <- data.frame(tumor=i,t(z2))
+  cms[[i]] <- z2
+}
+cms <- bind_rows(cms)
+cms[is.na(cms)] <- 0
+
+library(fitdistrplus) #evaluate distribution types. They are all parametrizations of normal distributions#
+l <- list()
+for(i in unique(cms$tumor)){
+  p <- subset(cms, cms$tumor==i)
+  print(paste0("fitting distributions to ",i))
+  fit <- fitDist(as.numeric(p[,c(2:ncol(p))]), k = 2, type = "realline", trace = FALSE, try.gamlss = TRUE)
+  l[[i]] <- data.frame(tumor=i,fam=fit$family)
+}
+l <- bind_rows(l)
+
+library(mixtools) #EM#
+l <- list() 
+for(i in c(3:ncol(ndf))){
+  x <- ndf[,i]
+  print(paste0("running EM for ",names(cms)[i]))
+  if(var(x)<0.001){print("0 variance, EM skipped!")
+    df <- data.frame(tumor="none",values=0,gene=names(cms)[i])}else{
+  skip_to_next <- F
+  set.seed(123)
+  tryCatch(normalmixEM(x,k=2), error = function(e) { skip_to_next <<- TRUE})
+  if(skip_to_next){print("too many starts (one variance is 0), EM skipped!")
+    df <- data.frame(tumor="none",values=0,gene=names(cms)[i])}else{
+  set.seed(123)
+  gm <- normalmixEM(x,k=2)
+  tr <- gm$mu[2]+(2*gm$sigma[2])
+  df <- data.frame(tumor=ndf$Subtype_Selected,values=x, gene=names(cms)[i])
+  df <- subset(df, df$values >= tr)
+  if(nrow(df)==0){df <- data.frame(tumor="none",values=0,gene=names(cms)[i])}else{df <- df}}}
+  l[[i]] <- df
+}
+l <- bind_rows(l)
+l <- subset(l, !l$tumor == "none")
+
+fin2 <- list() #compare against DEGs#
+for(i in unique(fin$tumor)){
+  print(paste0("selecting DEGs for ",i))
+  z <- subset(fin, fin$tumor == i)
+  z1 <- unique(z[,1])
+  z <- subset(l, l$tumor == i)
+  z2 <- unique(z[,3])
+  it <- intersect(z1,z2)
+  if(length(it)==0){df <- data.frame(tumor=i,gene="none")}else{
+    df <- data.frame(tumor=i,gene=it)}
+  fin2[[i]] <- df
+}
+fin2 <- bind_rows(fin2)
+fin2 <- merge(fin2, ndf[,c(1:2)],by.x="tumor",by.y="Subtype_Selected")
+fin2 <- unique(fin2)
+#barplot(table(fin2$cancer.type.abbreviation),las=2)
+
+EMdf <- l
+
+l <- list() #overall pheatmap/tSNE with DEGS. All tumors are well separated#
+for(i in unique(fin2$cancer.type.abbreviation)){
+  z <- subset(fin2, fin2$cancer.type.abbreviation == i)
+  z2 <- data.frame(tumor=i,t(rep(1,length(unique(z$gene)))))
+  colnames(z2)[2:ncol(z2)] <- unique(z$gene)
+  l[[i]] <- z2
+}
+l <- bind_rows(l)
+l[is.na(l)] <- 0
+rownames(l) <- l[,1]
+l[,1] <- NULL
+pheatmap(l, breaks = c(-1,0,1), color = c("white","red"), fontsize = 5)
+l2 <- t(l)
+l2 <- cor(l2)
+pheatmap(l2, breaks = c(-1,0.2,1), color = c("white","red"), fontsize = 5)
+
+tab <- ndf[, colnames(ndf) %in% unique(fin2$gene)]
+rt <- Rtsne(tab, pca_center = F, perplexity = 663, eta = 553) 
+d <- data.frame(labels=ndf[,1],tum.type=ndf[,2],x=rt$Y[,1],y=rt$Y[,2])
+
+ggplot(data = d, aes(x,y)) + geom_point(aes(colour = as.factor(labels)), size = 1) + theme_void()
+
+setwd(dir.res)
+fwrite(fin2, "step2_pruned by EM_significant genes.txt", row.names = F, quote = F)
+setwd(dir.data)
+#setwd(dir.res)
+#fin2 <- fread("step2_pruned by EM_significant genes.txt", header=T, quote = F) #if restarting#
+#fin2 <- as.data.frame(fin2)
+#setwd(dir.data)
+
+```
+
+# STEP 3: SPARSE PRINCIPAL COMPONENT REGRESSION - & RANDOM FOREST REGRESSION - BASED INFERENCE OF REGULATORY INTERACTIONS
+
+The approach chosen leverages on sparse principal component regression (SPCR) and random forest regression (RFR) to model all possible regulators against each matrisome gene per each tumor subtype. This step is computationally very intensive, poorly to no optimized, and might take several days to complete on a standard machine. Users are advised to skip these parts and move directly to step 4, where the results of this section (provided with the data dump) are drawn and integrated. The remainder of the code is left for users who want to attempt reconstructing this section too.
+
+To better cope with our data we introduce two restrictions before regressing possible regulators against the DEGs defined above:
+ - we only model tumor subtypes with at least 10 patients
+ - we only model matrisome genes with at least 10 non-zero expression patients
+ (these first 2 conditions should avoid foreseeable non-convergence problems)
+ 
+Select tumor types and matrisome genes based on patient numbers and non-zero expression.
+
+```{r eval = F}
+
+data <- readRDS("data dump.rds")
+setwd(dir.res)
+fin2 <- fread("step2_pruned by EM_significant genes.txt", header=T, sep=",") 
+fin2 <- as.data.frame(fin2)
+setwd(dir.data)
+
+fin2 <- subset(fin2, !fin2$gene == "none")
+tr1 <- as.data.frame(table(data$clinical.data$Subtype_Selected))
+tr1 <- tr1[tr1$Freq >= 10,] #removes 6 tumor subtypes#
+tr1 <- subset(tr1, tr1$Var1 %in% fin2$tumor) #removes 6 more subtypes#
+res <- list()
+for(i in tr1$Var1){
+  print(paste0("checking DEGs in ",i))
+  z <- subset(tr1, tr1$Var1 == i)
+  z <- as.character(z[,1])
+  cl <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == i)
+  m <- subset(data$matrisome.data, data$matrisome.data$sample %in% cl$sample)
+  m[,1] <- NULL
+  ge <- subset(fin2, fin2$tumor == i)
+  m <- subset(m, select = colnames(m) %in% ge$gene)
+  m[is.na(m)] <- 0
+  n <- colSums(m != 0) > 0
+  n <- n[n=="TRUE"]
+  res[[i]] <- data.frame(tumor.type=i, vars=as.character(names(n)))
+}
+res <- bind_rows(res)
+tg.selector <- res
+res <- NULL
+
+```
+
+SPCR-GLM. This workflow builds largely on the previous work by Kawano et al. (https://www.sciencedirect.com/science/article/pii/S0167947318300562). No parallelization, very slow procedure (especially penalty estimation). To speed up completion, we ran this chunk on a server with 32 xeon cores running Microsoft R Open 3.5.3 with MKL BLAS. The results will be integrated into the data dump next to ease re-running this section. The analysis finishes with results for 77 tumor subtypes, 259 unique matrisome genes and 374 unique regressors.
+
+```{r eval = F}
+
+library(glmnet)
+library(spcr)
+
+res <- list()
+res2 <- list()
+ct <- 0
+for(q in unique(tg.selector$tumor.type)){
+  
+  ct <- ct+1
+  
+  v <- subset(tg.selector, tg.selector$tumor.type == q)
+  v <- v$vars
+  
+  #select the tumor subtype#
+  z <- subset(data$clinical.data, data$clinical.data$Subtype_Selected %in% q)
+  z <- z[order(z$sample),]
+  sz <- z$sample
+  
+  print(paste0("tumor type ",ct," of ", length(unique(tg.selector$tumor.type)),": initiate analyses for ", q))
+  
+  for(i in v){
+    
+    print(paste0("*** ",ct," of ",length(unique(tg.selector$tumor.type)),
+                 ", gene: ",i,
+                 " - forming covariate matrix "))
+    
+    #select the matrisome expression per gene#
+    y <- subset(data$matrisome.data, data$matrisome.data[,1] %in% sz)
+    y <- y[order(y$sample),]
+    y <- y[,colnames(y) %in% i]
+    y[is.na(y)] <- 0
+    if(length(y[y>0])==0){print("*** warning: Y is NA/0 in this subtype! Failsafe mechanism evoked")
+      df <- data.frame(vars="none", B.loadings=0, matrisome.gene=i, tumor=q, warning="Y failsafe triggered")
+      res[[i]] <- df}else{
+    
+    #select the methylation values per gene#
+    x1 <- as.data.frame(data$methylation.data)
+    x1[is.na(x1)] <- 0
+    x1 <- x1[order(x1$sample),]
+    x1 <- subset(x1, x1$sample %in% sz)
+    x1 <- x1[,colnames(x1) %in% c("sample",i)]
+    names(x1)[2] <- "met"
+    if(length(x1) == 0){x1 <- data.frame(sample=sz, met=rep(0, length(y)))}else{
+      if(class(x1)=="data.frame"){x1 <- x1}else{x1 <- data.frame(sample=sz, met=rep(0, length(y)))}
+      }
+    
+    #select the CNA values per gene#
+    x2 <- data$cna.data
+    x2 <- x2[order(x2$sample),]
+    x2 <- subset(x2, x2$sample %in% sz)
+    x2 <- x2[,colnames(x2) %in% c("sample",i)]
+    names(x2)[2] <- "CNA"
+    if(length(x2) == 0){x2 <- data.frame(sample=sz, cna=rep(0, length(y)))}else{
+      if(class(x2)=="data.frame"){x2 <- x2}else{x2 <- data.frame(sample=sz, cna=rep(0, length(y)))}
+      }
+    
+    #select the mutations per gene#
+    x3 <- data$mutation.data
+    x3 <- subset(x3, x3$gene %in% i)
+    x3 <- x3[order(x3$sample),]
+    x3 <- subset(x3, x3$sample %in% sz)
+    if(nrow(x3) == 0){x3 <- data.frame(sample=sz, mut=rep(0, length(y)))}else{
+      if(class(x3)!="data.frame"){x3 <- data.frame(sample=sz, mut=rep(0, length(y)))}else{
+      n <- as.matrix(table(x3$sample,x3$Amino_Acid_Change))
+      x3 <- as.data.frame.matrix(n)
+      x3$sample <- rownames(x3)
+      rownames(x3) <- NULL
+      }}
+    
+    #select the gene program per tumor subtype#
+    x4 <- subset(data$gp.data, data$gp.data$sample %in% sz)
+    x4 <- x4[order(x4$sample),]
+    x4 <- Filter(function(x)!all(is.na(x)), x4)
+    if(nrow(x4) == 0){x4 <- data.frame(sample=sz, gp=rep(0, length(y)))}else{x4 <- x4}
+    
+    #select the miRNA quantity per gene#
+    s <- subset(data$mirna.vocabulary, data$mirna.vocabulary$`Target Gene` %in% i)
+    if(nrow(s) == 0){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{
+      if(class(s)!="data.frame"){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{
+      s <- unique(s$miRNA)
+      s2 <- data$mirna.data
+      s2 <- subset(s2, s2$sample %in% sz)
+      s2 <- s2[order(s2$sample),]
+      x5 <- s2[,colnames(s2) %in% c("sample",s)]
+      s <- NULL
+      s2 <- NULL
+    }}
+    if(class(x5)!="data.frame"){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{x5 <- x5}
+    
+    #select the purity per tumor subtype#
+    x6 <- subset(data$tumor.purity, data$tumor.purity$sample %in% sz)
+    x6 <- x6[,c(1,3)]
+    
+    #select the TF expression per gene#
+    s <- subset(data$tf.vocabulary, data$tf.vocabulary$target %in% i)
+    if(nrow(s) == 0){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{
+      if(class(x7)!="data.frame"){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{
+      s <- unique(s$TF)
+      s2 <- data$tf.data
+      s2 <- subset(s2, s2$sample %in% sz)
+      s2 <- s2[order(s2$sample),]
+      x7 <- s2[,colnames(s2) %in% c("sample",s)]
+      s <- NULL
+      s2 <- NULL
+    }}
+    if(class(x7)!="data.frame"){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{x7 <- x7}
+    
+    #create the X frame for regression#
+    nx <- Reduce(function(x,y) merge(x = x, y = y, by = "sample", all=T), 
+       list(x1,x2,x3,x4,x5,x6,x7))
+    nx[is.na(nx)] <- 0
+    rownames(nx) <- nx$sample
+    nx$sample <- NULL
+    nx <- nx[, colSums(nx != 0) > 0]
+    xnx <- nx[vapply(nx, function(x) length(unique(x)) > 1, logical(1L))]
+    xnx <- scale(xnx, center = T, scale = T)
+    xnx <- xnx[order(rownames(xnx)),]
+    
+    print("*** calculating adaptive sparse PCR")
+    sp <- cv.spcr(as.matrix(xnx), as.vector(y), k=1, adaptive = T, center = F, scale = F)
+    nsp <- spcr(as.matrix(xnx), as.vector(y), k=1, adaptive = T, center = F, scale = F, lambda.B = sp$lambda.B.cv, lambda.gamma = sp$lambda.gamma.cv)
+    nsp <- data.frame(vars=colnames(xnx),coef=nsp$loadings.B)
+    nsp <- subset(nsp, nsp$coef > 0)
+    if(nrow(nsp)==0){
+      print(paste0("*** no explanatory variables found for ",i))
+      df <- data.frame(vars="none", B.loadings=0, matrisome.gene=i, tumor=q, warning="no aPCR variable")}else{
+        print(paste0("*** writing variables found for ",i))
+        df <- data.frame(vars=nsp$vars, B.loadings=nsp$coef, matrisome.gene=i, tumor=q, warning="selected aPCR variable")}}
+    
+  res[[i]] <- df
+ }
+res2[[q]] <- bind_rows(res)
+}
+res2 <- bind_rows(res2) 
+res2 <- subset(res2, !res2$vars == "none")
+res2 <- unique(res2)
+fwrite(res2, "step3_SPCR_results.txt", sep="\t", row.names = F, quote = F)
+
+tab1 <- as.data.frame(table(res2$tumor))
+tab2 <- as.data.frame(table(res2$tumor,res2$vars))
+tab3 <- as.data.frame(table(res2$tumor,res2$matrisome.gene))
+tab <- merge(tab1,merge(tab2,tab3,by="Var1"),by="Var1")
+tab <- subset(tab, !tab$Freq.x == 0 & !tab$Freq.y == 0)
+tab <- unique(tab)
+colnames(tab) <- c("Tumor.type","N.of.interactions","Regulators","Freq.of.regulators","matrisome.target","Freq.of.target")
+#tab <- tab[,c(1:3,5)]
+fwrite(tab, "step3_table of interactions_SPCR.txt", sep="\t", row.names = F, quote = F)
+
+```
+
+Random Forest Regression (RFR). No parallelization, very slow procedure (especially optimization of parameters such as max nodes), significantly more than SPCR-GLM. To speed up completion, we ran this chunk on a server with 32 xeon cores running Microsoft R Open 3.5.3 with MKL BLAS. The results are provided to ease re-running this section. The analysis finishes with results for 83 tumor subtypes, 315 unique matrisome genes and 377 unique regressors. 
+
+```{r eval = F}
+
+library(randomForest)
+library(caret)
+library(e1071)
+
+res <- list()
+res2 <- list()
+ct <- 0
+for(q in unique(tg.selector$tumor.type)){
+  
+  ct <- ct+1
+  
+  v <- subset(tg.selector, tg.selector$tumor.type == q)
+  v <- v$vars
+  
+  #select the tumor subtype#
+  z <- subset(data$clinical.data, data$clinical.data$Subtype_Selected %in% q)
+  z <- z[order(z$sample),]
+  sz <- z$sample
+  
+  print(paste0("tumor type ",ct," of ", length(unique(tg.selector$tumor.type)),": initiate analyses for ", q))
+  
+  for(i in v){
+    
+    print(paste0("*** ",ct," of ",length(unique(tg.selector$tumor.type)),
+                 ", gene: ",i,
+                 " - forming covariate matrix "))
+    
+    #select the matrisome expression per gene#
+    y <- subset(data$matrisome.data, data$matrisome.data[,1] %in% sz)
+    y <- y[order(y$sample),]
+    y <- y[,colnames(y) %in% i]
+    y[is.na(y)] <- 0
+    if(length(y[y>0])==0){print("*** warning: Y is NA/0 in this subtype! Failsafe mechanism evoked")
+      df <- data.frame(vars="none", B.loadings=0, matrisome.gene=i, tumor=q, warning="Y failsafe triggered")
+      res[[i]] <- df}else{
+    
+    #select the methylation values per gene#
+    x1 <- as.data.frame(data$methylation.data)
+    x1[is.na(x1)] <- 0
+    x1 <- x1[order(x1$sample),]
+    x1 <- subset(x1, x1$sample %in% sz)
+    x1 <- x1[,colnames(x1) %in% c("sample",i)]
+    names(x1)[2] <- "met"
+    if(length(x1) == 0){x1 <- data.frame(sample=sz, met=rep(0, length(y)))}else{
+      if(class(x1)=="data.frame"){x1 <- x1}else{x1 <- data.frame(sample=sz, met=rep(0, length(y)))}
+      }
+    
+    #select the CNA values per gene#
+    x2 <- data$cna.data
+    x2 <- x2[order(x2$sample),]
+    x2 <- subset(x2, x2$sample %in% sz)
+    x2 <- x2[,colnames(x2) %in% c("sample",i)]
+    names(x2)[2] <- "CNA"
+    if(length(x2) == 0){x2 <- data.frame(sample=sz, cna=rep(0, length(y)))}else{
+      if(class(x2)=="data.frame"){x2 <- x2}else{x2 <- data.frame(sample=sz, cna=rep(0, length(y)))}
+      }
+    
+    #select the mutations per gene#
+    x3 <- data$mutation.data
+    x3 <- subset(x3, x3$gene %in% i)
+    x3 <- x3[order(x3$sample),]
+    x3 <- subset(x3, x3$sample %in% sz)
+    if(nrow(x3) == 0){x3 <- data.frame(sample=sz, mut=rep(0, length(y)))}else{
+      if(class(x3)!="data.frame"){x3 <- data.frame(sample=sz, mut=rep(0, length(y)))}else{
+      n <- as.matrix(table(x3$sample,x3$Amino_Acid_Change))
+      x3 <- as.data.frame.matrix(n)
+      x3$sample <- rownames(x3)
+      rownames(x3) <- NULL
+      }}
+    
+    #select the gene program per tumor subtype#
+    x4 <- subset(data$gp.data, data$gp.data$sample %in% sz)
+    x4 <- x4[order(x4$sample),]
+    x4 <- Filter(function(x)!all(is.na(x)), x4)
+    if(nrow(x4) == 0){x4 <- data.frame(sample=sz, gp=rep(0, length(y)))}else{x4 <- x4}
+    
+    #select the miRNA quantity per gene#
+    s <- subset(data$mirna.vocabulary, data$mirna.vocabulary$`Target Gene` %in% i)
+    if(nrow(s) == 0){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{
+      if(class(s)!="data.frame"){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{
+      s <- unique(s$miRNA)
+      s2 <- data$mirna.data
+      s2 <- subset(s2, s2$sample %in% sz)
+      s2 <- s2[order(s2$sample),]
+      x5 <- s2[,colnames(s2) %in% c("sample",s)]
+      s <- NULL
+      s2 <- NULL
+    }}
+    if(class(x5)!="data.frame"){x5 <- data.frame(sample=sz, mirna=rep(0, length(y)))}else{x5 <- x5}
+    
+    #select the purity per tumor subtype#
+    x6 <- subset(data$tumor.purity, data$tumor.purity$sample %in% sz)
+    x6 <- x6[,c(1,3)]
+    
+    #select the TF expression per gene#
+    s <- subset(data$tf.vocabulary, data$tf.vocabulary$target %in% i)
+    if(nrow(s) == 0){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{
+      if(class(s)!="data.frame"){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{
+      s <- unique(s$TF)
+      s2 <- data$tf.data
+      s2 <- subset(s2, s2$sample %in% sz)
+      s2 <- s2[order(s2$sample),]
+      x7 <- s2[,colnames(s2) %in% c("sample",s)]
+      s <- NULL
+      s2 <- NULL
+    }}
+    if(class(x7)!="data.frame"){x7 <- data.frame(sample=sz, tf=rep(0, length(y)))}else{x7 <- x7}
+    
+    #create the X frame for regression#
+    nx <- Reduce(function(x,y) merge(x = x, y = y, by = "sample", all=T), 
+       list(x1,x2,x3,x4,x5,x6,x7))
+    nx[is.na(nx)] <- 0
+    rownames(nx) <- nx$sample
+    nx$sample <- NULL
+    nx <- nx[, colSums(nx != 0) > 0]
+    xnx <- nx[vapply(nx, function(x) length(unique(x)) > 1, logical(1L))]
+    xnx <- scale(xnx, center = T, scale = T)
+    xnx <- xnx[order(rownames(xnx)),]
+    
+    print("*** optimizing Random Forest parameters")
+    
+    trControl <- trainControl(method = "cv",
+    number = 10,
+    search = "grid")
+    
+    data_train <- cbind(y,xnx)
+    
+    print("*** setting mtry")
+    set.seed(123)
+    tuneGrid <- expand.grid(.mtry = c(1: 10))
+    rf_mtry <- train(y~.,
+    data = data_train,
+    method = "rf",
+    metric = "RMSE",
+    tuneGrid = tuneGrid,
+    trControl = trControl,
+    importance = TRUE,
+    nodesize = 2,
+    ntree = 300)
+    best_mtry <- rf_mtry$bestTune$mtry
+    if(length(best_mtry)==0){best_mtry <- 1}else{best_mtry <- best_mtry}
+    
+    print(("*** setting maxnodes"))
+    store_maxnode <- list()
+    tuneGrid <- expand.grid(.mtry = best_mtry)
+    for (maxnodes in c(2: ncol(xnx))) {
+    set.seed(123)
+    rf_maxnode <- train(y~.,
+        data = data_train,
+        method = "rf",
+        metric = "RMSE",
+        tuneGrid = tuneGrid,
+        trControl = trControl,
+        importance = TRUE,
+        nodesize = 2,
+        maxnodes = maxnodes,
+        ntree = 300)
+    current_iteration <- toString(maxnodes)
+    store_maxnode[[current_iteration]] <- rf_maxnode
+    }
+    results_mtry <- resamples(store_maxnode)
+    sm <- sm <- summary(results_mtry)
+    sm <- as.data.frame(sm$statistics$RMSE)
+    sm <- sm[order(sm$Mean),]
+    sm <- as.numeric(rownames(sm[1,]))
+    if(length(sm)==0){sm <- 10}else{sm <- sm}
+   
+    print(("*** setting maxtrees"))
+    store_maxtrees <- list()
+    for (ntree in c(50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 800, 1000, 2000)) {
+    set.seed(123)
+    rf_maxtrees <- train(y~.,
+        data = data_train,
+        method = "rf",
+        metric = "RMSE",
+        tuneGrid = tuneGrid,
+        trControl = trControl,
+        importance = TRUE,
+        nodesize = 2,
+        maxnodes = sm,
+        ntree = ntree)
+    key <- toString(ntree)
+    store_maxtrees[[key]] <- rf_maxtrees
+    }
+    results_tree <- resamples(store_maxtrees)
+    st <- summary(results_tree)
+    st <- as.data.frame(st$statistics$RMSE)
+    st <- st[order(st$Mean),]
+    st <- as.numeric(rownames(st[1,]))
+    if(length(st)==0){st <- 300}else{st <- st}
+   
+    print(("*** calculating Random Forest"))
+    set.seed(123)
+    rf_fin <- train(y~.,
+    data = data_train,
+    method = "rf",
+    tuneGrid = tuneGrid,
+    trControl = trControl,
+    importance = TRUE,
+    nodesize = 2,
+    ntree = sm,
+    maxnodes = st)
+    
+    vrs <- varImp(rf_fin)$importance
+    nsp <- subset(vrs, vrs$Overall > 90)
+    
+    if(nrow(nsp)==0){
+      print(paste0("*** no explanatory variables found for ",i))
+      df <- data.frame(vars="none", matrisome.gene=i, tumor=q, warning="no RF variable")}else{
+        print(paste0("*** writing variables found for ",i))
+        df <- data.frame(vars=rownames(nsp), matrisome.gene=i, tumor=q, warning="selected RF variable")}}
+    
+  res[[i]] <- df
+ }
+res2[[q]] <- bind_rows(res)
+}
+res2 <- bind_rows(res2) 
+res2 <- subset(res2, !res2$vars == "none")
+res2 <- unique(res2)
+fwrite(res2, "step3_RF_results.txt", sep="\t", row.names = F, quote = F)
+
+tab1 <- as.data.frame(table(res2$tumor))
+tab2 <- as.data.frame(table(res2$tumor,res2$vars))
+tab3 <- as.data.frame(table(res2$tumor,res2$matrisome.gene))
+tab <- merge(tab1,merge(tab2,tab3,by="Var1"),by="Var1")
+tab <- subset(tab, !tab$Freq.x == 0 & !tab$Freq.y == 0)
+tab <- unique(tab)
+colnames(tab) <- c("Tumor.type","N.of.interactions","Regulators","Freq.of.regulators","matrisome.target","Freq.of.target")
+#tab <- tab[,c(1:3,5)]
+fwrite(tab, "step3_table of interactions_RF.txt", sep="\t", row.names = F, quote = F)
+
+```
+
+Binding results from SPCR and RFR into the data dump.
+
+```{r eval = F}
+
+setwd(dir.data)
+data <- readRDS("data dump.rds")
+setwd(dir.res)
+tab <- fread("step3_SPCR_results.txt", header=T, sep="\t")
+tab <- as.data.frame(tab)
+tab2 <- fread("step3_RF_results.txt", header=T, sep="\t")
+tab2 <- as.data.frame(tab2)
+tab2$vars <- gsub("\\`","",tab2$vars)
+data$SPCR <- tab
+data$RF <- tab2
+setwd(dir.data)
+saveRDS(data, "data dump.rds")
+
+```
+
+Comparison of the lists shows the different results, with 116 tumor type-regressor-matrisome target triplets shared by the two approaches, 1318 triplets from SPCR only and 1894 triplets from RFR only.
+
+```{r eval = F}
+
+#if restarting:
+#data <- readRDS("data dump.rds")
+#tab <- data$SPCR
+#tab2 <- data$RF
+
+tab$vars <- make.names(tab$vars) #regressor names differ because of the processing#
+tab.1 <- subset(tab, tab$vars=="CNA" | tab$vars=="met")
+tab.1$vars <- tolower(tab.1$vars)
+tab.1$vars <- paste0(tab.1$matrisome.gene,".",tab.1$vars)
+tab <- subset(tab, !tab$vars=="CNA" & !tab$vars=="met")
+tab <- bind_rows(tab, tab.1)
+
+tab2$vars <- make.names(tab2$vars)
+tab.1 <- subset(tab2, tab2$vars=="CNA" | tab2$vars=="met")
+tab.1$vars <- tolower(tab.1$vars)
+tab.1$vars <- paste0(tab.1$matrisome.gene,".",tab.1$vars)
+tab2 <- subset(tab2, !tab2$vars=="CNA" & !tab2$vars=="met")
+tab2 <- bind_rows(tab2, tab.1)
+
+nr <- list()
+for(i in unique(c(tab$tumor,tab2$tumor))){
+  z <- subset(tab, tab$tumor == i)
+  z2 <- subset(tab2, tab2$tumor == i)
+  l1 <- paste0(z$vars,"***",z$matrisome.gene)
+  l2 <- paste0(z2$vars,"***",z2$matrisome.gene)
+  l <- intersect(l1,l2)
+  if(length(l)==0){df <- data.frame(common.vars="none",tumor=i)}else{df <- data.frame(common.vars=l,tumor=i)}
+  nr[[i]] <- df
+}
+nr <- bind_rows(nr)
+nr <- subset(nr, !nr$common.vars=="none")
+nr$attribute <- "common"
+
+nl <- bind_rows(tab,tab2)
+nl$new.vars <- paste0(nl$vars,"***",nl$matrisome.gene)
+nl <- merge(nr, nl, by.x=c("common.vars","tumor"),by.y=c("new.vars","tumor"), all = T)
+nl$attribute[is.na(nl$attribute)] <- "single"
+nl$B.loadings <- NULL
+nl$common.vars <- NULL
+nl$warning <- ifelse(nl$attribute == "common", "common to both", as.character(nl$warning))
+nl <- unique(nl)
+
+table(nl$warning) #number of triples per method#
+
+library(ggsci)
+res <- as.data.frame(table(nl$tumor,nl$warning))
+ggplot(res, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity") +
+  scale_fill_d3() + 
+  theme_classic() + 
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+# STEP 4: REGRESSOR INTEGRATION AND PRUNING VIA AUC ROC
+
+The two lists of results differ in size and findings as they originate from distinct approaches with diverse mathematical standpoints, and an a priori definition of which results are "better" or "more likely" would have no ground. To integrate the results we then stack the two models, calculate logistic regression per each tumor type-regressor-matrisome target triplet and evaluate predictiveness on the same data via AUC-ROC. Results are subset to AUC > 0.8. The final interaction list includes 74 tumor subtypes, 153 robust regressors and 210 matrisome genes. 98% of all the interactions are unique, with only 2% present twice.
+
+```{r eval = F}
+
+library(stringr)
+library(ROCR)
+res <- list()
+res2 <- list()
+res3 <- list()
+ct <- 0
+for(k in unique(nl$tumor)){
+  ct <- ct+1
+  
+  z <- subset(nl, nl$tumor == k)
+  
+  print(paste0(ct, " of ", length(unique(nl$tumor)), " ", k,": fetching and shaping regressors"))
+  
+  x1 <- subset(data$matrisome.data, select = c("sample",unique(z$matrisome.gene))) #matrisome genes#
+  
+  x2 <- subset(data$mutation.data, data$mutation.data$Amino_Acid_Change %in% unique(z$vars))  #mutation data#
+  if(nrow(x2)==0){x2 <- data.frame(sample=x1$sample)}else{x2 <- x2[,c(1,9)]
+  tm <- as.data.frame.matrix(table(x2$sample,x2$Amino_Acid_Change))
+  tm$sample <- rownames(tm)
+  x2 <- tm
+  sam <- data.frame(sample=x1$sample)
+  x2 <- merge(sam,x2,by="sample",all=T)
+  x2[is.na(x2)] <- 0}
+  
+  its <- intersect(unique(z$matrisome.gene),colnames(data$cna.data))
+  x3 <- subset(data$cna.data, select = c("sample",its)) #CNA data#
+  sl <-subset(z, str_detect(z$vars,".cna"))
+  if(nrow(sl)==0){x3 <- data.frame(sample=x1$sample)}else{
+    x3 <- x3[,colnames(x3) %in% c("sample",unique(sl$matrisome.gene))]
+    names(x3)[2:ncol(x3)] <- paste0(names(x3)[2:ncol(x3)],".cna")}
+  
+  x4 <- data$gp.data #gene programs#
+  rownames(x4) <- x4[,1]
+  x4[,1] <- NULL
+  x4 <- t(x4)
+  rownames(x4) <- make.names(rownames(x4))
+  n <- rownames(x4)[rownames(x4) %in% unique(z$vars)]
+  x4 <- subset(x4, rownames(x4) %in% unique(z$vars))
+  if(nrow(x4)==0){x4 <- data.frame(sample=x1$sample)}else{
+    rownames(x4) <- n
+    x4 <- t(x4)
+    x4 <- data.frame(sample=rownames(x4),x4)}
+    
+  x5 <- data$mirna.data #miRNAs#
+  rownames(x5) <- x5[,1]
+  x5[,1] <- NULL
+  x5 <- t(x5)
+  rownames(x5) <- gsub("-","\\.",rownames(x5))
+  n <- rownames(x5)[rownames(x5) %in% unique(z$vars)]
+  x5 <- subset(x5, rownames(x5) %in% unique(z$vars))
+  if(nrow(x5)==0){x5 <- data.frame(sample=x1$sample)}else{
+    rownames(x5) <- n
+    x5 <- t(x5)
+    x5 <- data.frame(sample=rownames(x5),x5)}
+  
+  x6 <- data$tumor.purity #tumor purity#
+  x6[,2] <- NULL
+  rownames(x6) <- x6[,1]
+  x6[,1] <- NULL
+  x6$sample <- rownames(x6)
+  if("st.fraction" %in% unique(z$vars)){
+  x6 <- data$tumor.purity
+  x6 <- x6[c(1,3)]}else{x6 <- data.frame(sample=x1$sample)}
+    
+  x7 <- data$tf.data #TFs#
+  rownames(x7) <- x7[,1]
+  x7[,1] <- NULL
+  x7 <- t(x7)
+  n <- rownames(x7)[rownames(x7) %in% unique(z$vars)]
+  x7 <- subset(x7, rownames(x7) %in% unique(z$vars))
+  if(nrow(x7)==0){x7 <- data.frame(sample=x1$sample)}else{
+    rownames(x7) <- n
+    x7 <- t(x7)
+    x7 <- data.frame(sample=rownames(x7),x7)}
+  
+  its <- intersect(unique(z$matrisome.gene),colnames(data$methylation.data))
+  x8 <- subset(data$methylation.data, select = c("sample",its)) #methylation#
+  sl <-subset(z, str_detect(z$vars,".met"))
+  if(nrow(sl)==0){x8 <- data.frame(sample=x1$sample)}else{
+    nams <- c("sample",unique(sl$matrisome.gene))
+    x8 <- subset(x8, select = nams)
+    names(x8)[2:ncol(x8)] <- paste0(names(x8)[2:ncol(x8)],".met")}
+  
+  nx <- Reduce(function(x,y) merge(x = x, y = y, by = "sample", all=T), 
+       list(x1,x2,x3,x4,x5,x6,x7,x8))
+  nx[is.na(nx)] <- 0
+  cl <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == k)
+  nx$label <- ifelse(nx$sample %in% cl$sample,1,0) 
+  nx$sample <- NULL
+  
+  for(i in unique(z$matrisome.gene)){
+    
+    y <- subset(nx, select="label")
+    sel2 <- subset(z, z$matrisome.gene == i)
+    int <- intersect(colnames(nx), unique(sel2$vars))
+    nnx <- subset(nx, select = int)
+    nnx <- cbind(y,nnx)
+    nnx$label <- as.factor(nnx$label)
+    
+    for(w in names(nnx[2:ncol(nnx)])){
+      print(paste0(" *** calculating AUC-ROC for ",i," - ",w))
+      nnx2 <- subset(nnx, select = c("label",w))
+      mod <- glm(label ~ .,family=binomial(link='logit'),data=nnx2)
+      nd <- as.data.frame(nnx2[,c(2:ncol(nnx2))])
+      names(nd) <- names(nnx2)[2:ncol(nnx2)]
+      
+      p <- predict(mod, newdata=nd, type="response")
+      pr <- prediction(p, nnx2$label)
+      auc <- performance(pr, measure = "auc")
+      auc <- auc@y.values[[1]]
+      auc
+      
+      df <- data.frame(tumor=k,matrisome.gene=i,vars=w,auc=auc)
+      res[[w]] <- df
+    }
+    res2[[i]] <- bind_rows(res)
+  }
+  res3[[k]] <- bind_rows(res2)
+}
+res3 <- bind_rows(res3)
+res3 <- unique(res3)  
+res3 <- subset(res3,res3$auc > 0.8)    
+setwd(dir.res)
+fwrite(res3, "step4_final list of regressors.txt", sep="\t", row.names = F, quote = F)
+
+```
+
+# STEP 5: VISUALIZATION OF RESULTS
+
+Visualization of regressor results, their frequencies, distribution, etc. At this step we also draw a final reduced-space representation of the whole data set using t-SNE and heatmaps. NOTE: the representation is built upon the expression of matrisome genes only and it doesn´t involve the regulators.
+
+```{r eval = F}
+
+setwd(dir.data)
+data <- readRDS("data dump.rds")
+setwd(dir.res)
+tab <- fread("step4_final list of regressors.txt", header=T, sep="\t")
+tab <- as.data.frame(tab)
+
+ntab <- merge(tab,nl,by=c("tumor","matrisome.gene","vars"))
+fwrite(ntab, "ntab.txt", sep="\t", row.names = F, quote = F)
+#if restarting:
+#ntab <- fread("ntab.txt", header=T, sep="\t")
+
+res <- as.data.frame(table(ntab$tumor, ntab$attribute))
+ggplot(res, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity") +
+  scale_fill_d3() + 
+  theme_classic() + 
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+r1 <- data.frame(var=data$mutation.data$Amino_Acid_Change, type="mutations")
+r2 <- data.frame(var=paste0(colnames(data$cna.data)[2:ncol(data$cna.data)],".cna"), type="CNAs")
+r3 <- data.frame(var=colnames(data$gp.data)[2:ncol(data$gp.data)], type="gene programs")
+r4 <- data.frame(var=colnames(data$mirna.data)[2:ncol(data$mirna.data)], type="miRNAs")
+r5 <- data.frame(var="st.fraction", type="stromal fraction")
+r6 <- data.frame(var=colnames(data$tf.data)[2:ncol(data$tf.data)], type="transcription factors")
+r7 <- data.frame(var=paste0(colnames(data$methylation.data)[2:ncol(data$methylation.data)],".met"), type="methylation")
+regs <- bind_rows(r1,r2,r3,r4,r5,r6,r7)
+regs$var <- make.names(regs$var)
+m <- merge(tab,regs,by.x="vars",by.y="var")
+d2 <- as.data.frame(table(m$type))
+ggplot(d2, aes(x="", y=Freq, fill=Var1)) +
+  geom_bar(width = 1, stat = "identity") +
+  scale_fill_d3() + 
+  coord_polar("y", start=0, direction = -1) + 
+  theme_void()
+
+d2 <- as.data.frame(table(m$type, m$tumor))
+ggplot(d2, aes(x=Var2, y=Freq, fill=Var1)) +
+     geom_bar(width = 1, position = "fill", stat = "identity") +
+     scale_fill_d3()+ theme_classic() + theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.1))
+
+sel <- subset(data$clinical.data, data$clinical.data$Subtype_Selected %in% tab$tumor)
+sel <- sel[,c(1,3,35)]
+m <- subset(data$matrisome.data, data$matrisome.data$sample %in% sel$sample)
+rownames(m) <- m$sample
+m$sample <- NULL
+m <- subset(m, select=unique(tab$matrisome.gene))
+m$sample <- rownames(m)
+m <- merge(sel,m,by="sample")
+samps <- m$sample
+m[,1] <- NULL
+m[is.na(m)] <- 0
+
+#visualization with t-SNE#
+library(Rtsne)
+m2 <- normalize_input(as.matrix(m[,3:ncol(m)]))
+set.seed(123)
+rt <- Rtsne(m2, pca_center = F, perplexity = 663, eta = 553) 
+d <- data.frame(sample=samps,labels=m[,2],tum.type=m[,1],x=rt$Y[,1],y=rt$Y[,2])
+d$histo.type <- ifelse(d$tum.type == "OV","Gyn",
+                ifelse(d$tum.type == "UCEC", "Gyn",
+                ifelse(d$tum.type == "UCS", "Gyn",
+                ifelse(d$tum.type == "GBM", "Neuroendocrine",
+                ifelse(d$tum.type == "LGG", "Neuroendocrine",
+                ifelse(d$tum.type == "PCPG","Neuroendocrine",
+                ifelse(d$tum.type == "ACC", "Neuroendocrine",
+                ifelse(d$tum.type == "COAD", "Gi",
+                ifelse(d$tum.type == "READ", "Gi",
+                ifelse(d$tum.type == "STAD", "Gi-associated",
+                ifelse(d$tum.type == "LIHC", "Gi-associated",
+                ifelse(d$tum.type == "ESCA", "Squamous",
+                ifelse(d$tum.type == "HNSC", "Squamous",
+                ifelse(d$tum.type == "LUSC", "Squamous",
+                ifelse(d$tum.type == "LAML", "Blood",
+                ifelse(d$tum.type == "KICH", "Renal",
+                ifelse(d$tum.type == "KIRC", "Renal",
+                ifelse(d$tum.type == "KIRP", "Renal",
+                       "other"))))))))))))))))))
+write.table(d, "coordinates of tsne.txt", row.names = F, quote = F, sep="\t")
+#if restarting:
+#setwd(dir.res)
+#d <- fread("coordinates of tsne.txt", header=T, sep="\t")
+#d <- as.data.frame(d)
+
+ggplot(data = d, aes(x,y)) +
+  geom_point(aes(colour = labels), size = 1) + 
+  theme_void()
+
+#This version harbors an overlay of grey dots for the subtypes#
+ggplot(data = d, aes(x,y)) +
+  geom_point(aes(colour = tum.type), alpha=0.8, size = 2) + 
+  geom_point(mapping = aes(fill=labels, colour="grey80"), alpha=0.05, size = 2) +
+  theme_void()
+
+mm <- merge(tab,regs,by.x="vars",by.y="var")
+bigd <- merge(d,mm,by.x="labels",by.y="tumor")
+
+ggplot(data = bigd, aes(x,y)) + geom_point(aes(colour = as.factor(type)), size = 1) +
+  scale_color_jco() +
+  theme_void() + facet_wrap(~type)
+
+#correlation of tumor types & subtypes#
+m3 <- t(m2)
+colnames(m3) <- m$`cancer type abbreviation`
+m3 <- t(m3)
+res <- list()
+for(i in unique(rownames(m3))){
+  z <- subset(m3, rownames(m3)==i)
+  z <- data.frame(tumor=i, t(colMeans(z)))
+  res[[i]] <- z
+}
+res <- bind_rows(res)
+rownames(res) <- res[,1]
+res[,1] <- NULL
+res <- t(res)
+M <- cor(res, method="spearman")
+pheatmap(M, scale="none")
+
+m3 <- t(m2)
+colnames(m3) <- m$Subtype_Selected
+m3 <- t(m3)
+res <- list()
+for(i in unique(rownames(m3))){
+  z <- subset(m3, rownames(m3)==i)
+  z <- data.frame(tumor=i, t(colMeans(z)))
+  res[[i]] <- z
+}
+res <- bind_rows(res)
+rownames(res) <- res[,1]
+res[,1] <- NULL
+res <- t(res)
+M <- cor(res, method="spearman")
+pheatmap(M, scale="none")
+
+```
+
+Circular barplot and circular correlation chart. NOTE: in the correlation chart, only Spearman correlation values > 0.5 are reported (all other are zeroed) to reduce cluttering of the graph.
+
+```{r eval = F}
+
+ntab <- merge(tab, regs, by.x="vars", by.y="var")
+d2 <- d[,c(2,3)]
+ntab <- merge(ntab, d2, by.x="tumor",by.y="labels")
+ntab <- unique(ntab)
+
+ntab2 <- as.data.frame(table(ntab$tumor, ntab$type))
+
+data <- ntab2
+res <- list()
+for(i in unique(data$Var1)){
+  z <- subset(data, data$Var1 == i)
+  z$Freq <- round((z$Freq/sum(z$Freq))*100,0)
+  res[[i]] <- z
+}
+res <- bind_rows(res)
+data <- res
+empty_bar <- 2
+nObsType <- nlevels(as.factor(data$Var2))
+to_add <- data.frame( matrix(NA, empty_bar*nlevels(data$Var1)*nObsType, ncol(data)) )
+colnames(to_add) <- colnames(data)
+to_add$Var1 <- rep(levels(data$Var1), each=empty_bar*nObsType )
+data <- rbind(data, to_add)
+data <- data %>% arrange(Var1, Var2)
+data$id <- rep( seq(1, nrow(data)/nObsType) , each=nObsType)
+label_data <- data %>% group_by(id, Var1) %>% summarize(tot=sum(Freq))
+number_of_bar <- nrow(label_data)
+angle <- 90 - 360 * (label_data$id-0.5) /number_of_bar     
+label_data$hjust <- ifelse( angle < -90, 1, 0)
+label_data$angle <- ifelse(angle < -90, angle+180, angle)
+
+ggplot(data) +
+  geom_bar(aes(x=as.factor(id), y=Freq, fill=Var2), stat="identity", alpha=0.5) +
+  scale_fill_jco() +
+  ylim(-150,max(label_data$tot, na.rm=T)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.margin = unit(rep(-1,4), "cm") 
+  ) +
+  coord_polar() +
+  geom_text(data=label_data, aes(x=id, y=tot+10, label=Var1, hjust=hjust), color="black", fontface="bold",alpha=0.6, size=2, angle= label_data$angle, inherit.aes = FALSE )
+
+m3 <- t(m2)
+colnames(m3) <- m$`cancer type abbreviation`
+m3 <- t(m3)
+res <- list()
+for(i in unique(rownames(m3))){
+  z <- subset(m3, rownames(m3)==i)
+  z <- data.frame(tumor=i, t(colMeans(z)))
+  res[[i]] <- z
+}
+res <- bind_rows(res)
+rownames(res) <- res[,1]
+res[,1] <- NULL
+res <- t(res)
+M <- cor(res, method="spearman")
+library(reshape2)
+cc <- melt(M)
+cc <- cc[order(as.character(cc$Var1)),]
+cc$value <- ifelse(abs(cc$value) >= 0.5,1,0) #this significantly reduces the amount of chords to plot, that otherwise clutter the graph#
+
+gg_color_hue <- function(n) { #same colors as default plotting in tSNE#
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]}
+
+library(circlize)
+chordDiagram(cc, grid.col = gg_color_hue(24))
+
+```
+
+Classification of landamrk matrisome genes and interactions.
+
+```{r eval = F}
+
+ntab2 <- merge(ntab,data$matrisome.vocabulary,by.x="matrisome.gene",by.y="Gene.Symbol")
+
+#landmarks#
+
+sub <- unique(ntab2[,c(1,2,7,8)])
+tab1 <- as.data.frame(table(sub$Division))
+ggplot(tab1, aes(x="1", y=Freq, fill=Var1)) + # side by side barplot #
+     geom_bar(position="fill" , stat="identity") + 
+     scale_fill_npg() + 
+     theme_classic() + xlab("") 
+
+tab1 <- as.data.frame(table(sub$Category))
+ggplot(tab1, aes(x="1", y=Freq, fill=Var1)) + # side by side barplot #
+     geom_bar(position="fill" , stat="identity") + 
+     scale_fill_jco() + 
+     theme_classic() + xlab("")
+
+#interactions#
+
+tab1 <- as.data.frame(table(ntab2$Division))
+ggplot(tab1, aes(x="1", y=Freq, fill=Var1)) + # side by side barplot #
+     geom_bar(position="fill" , stat="identity") + 
+     scale_fill_npg() + 
+     theme_classic() + xlab("") 
+
+tab1 <- as.data.frame(table(ntab2$Category))
+ggplot(tab1, aes(x="1", y=Freq, fill=Var1)) + # side by side barplot #
+     geom_bar(position="fill" , stat="identity") + 
+     scale_fill_jco() + 
+     theme_classic() + xlab("")
+
+#landmarks by tumor#
+
+sub <- unique(ntab2[,c(1,2,7,8)])
+tab1 <- as.data.frame(table(sub$Category,sub$tumor))
+ggplot(tab1, aes(x=Var2, y=Freq, fill=Var1)) + # side by side barplot #
+     geom_bar(position="fill" , stat="identity") + 
+     scale_fill_jco() + 
+     theme_classic() + xlab("") +
+     theme(axis.text.x = element_text(angle = 90))
+
+#interactions, type by tumor#
+
+sub <- unique(ntab2[,c(2,3)])
+tab1 <- as.data.frame(table(sub$tumor, sub$vars))
+
+ggplot(tab1, aes(x=Var1, y=Var2, size=Freq, color=Var2)) +
+  geom_point(alpha=0.5) +
+  scale_size(range = c(.1, 2), name="Frequency") +
+  theme_classic() + theme(axis.text.x = element_text(angle = 90)) +
+  xlab("") + ylab("")
+
+sub$source <- ifelse(grepl("_", sub$vars, fixed = TRUE)==T,"gene program",
+                      ifelse(sub$vars == "st.fraction","stroma/immune",
+                      ifelse(sub$vars == "hsa.miR.193b.3p" | sub$vars == "hsa.miR.21.5p" | sub$vars == "hsa.miR.29c.3p","miRNA","TF")))
+tab1 <- table(sub$tumor, sub$source)
+tab1 <- round((tab1/rowSums(tab1))*100,0)
+library(viridis)
+pheatmap(t(tab1),color = inferno(100), cluster_cols = F)
+
+cd <- unique(data$clinical.data[,c(3,ncol(data$clinical.data))])
+names(cd)[2] <- "tumor"
+ntab2 <- merge(cd,ntab2,by="tumor")
+ntab2 <- ntab2[,c(2,1,3:ncol(ntab2))]
+
+```
+
+Prognostic evaluation or matrisome landmarks.
+
+```{r eval = F}
+
+library(survival)
+library(survminer)
+
+res <- list()
+res2 <- list()
+for(i in unique(ntab2$tumor)){
+  print(paste0("testing prognostics in ",i))
+  z <- subset(ntab2, ntab2$tumor == i)
+  k <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == i)
+  k <- k[,c(1,4,26,27)]
+  w <- subset(data$matrisome.data, data$matrisome.data$sample %in% k$sample)
+  for(j in unique(z$matrisome.gene)){
+    print(paste0("now sampling: ",j))
+    w1 <- w[,colnames(w) %in% c("sample",j)]
+    w1 <- merge(w1,k,by="sample")
+    w1$group <- ifelse(w1[,2]>mean(w1[,2],na.rm = T),"hi","lo")
+    fit <- survdiff(Surv(OS.time,OS)~group,data=w1)
+    p <- round(pchisq(fit$chisq, length(fit$n)-1, lower.tail = FALSE),3)
+    res[[j]] <- data.frame(tumor=i,matrisome=j,surv.pval=p)
+  }
+  res2[[i]] <- bind_rows(res)
+}
+res2 <- bind_rows(res2)
+res2 <- unique(subset(res2,res2$surv.pval < 0.05))
+
+#adjustment by age#
+
+res <- list()
+res3 <- list()
+for(i in unique(ntab2$tumor)){
+  print(paste0("testing prognostics in ",i))
+  z <- subset(ntab2, ntab2$tumor == i)
+  k <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == i)
+  k <- k[,c(1,4,26,27)]
+  w <- subset(data$matrisome.data, data$matrisome.data$sample %in% k$sample)
+  for(j in unique(z$matrisome.gene)){
+    print(paste0("now sampling: ",j))
+    w1 <- w[,colnames(w) %in% c("sample",j)]
+    w1 <- merge(w1,k,by="sample")
+    w1$group <- ifelse(w1[,2]>mean(w1[,2],na.rm = T),"hi","lo")
+    fit2 <- coxph( Surv(OS.time, OS) ~ age_at_initial_pathologic_diagnosis + strata(group), data = w1 )
+  s <- summary(fit2)
+  s <- s$logtest
+  res[[j]] <- data.frame(tumor=i,matrisome=j,surv.pval=s)
+  }
+  res3[[i]] <- bind_rows(res)
+}
+res3 <- bind_rows(res3)
+res3 <- unique(subset(res3,res3$surv.pval < 0.05))
+
+res2$id <- paste0(res2$tumor,"_",res2$matrisome)
+res3$id <- paste0(res3$tumor,"_",res3$matrisome)
+res2$eval <- ifelse(res2$id %in% res3$id,"age-dependent","age-independent")
+
+#graph results - only age-independent predictors are kept#
+sel <- subset(res2, res2$eval == "age-independent")
+for(i in unique(sel$tumor)){
+  print(paste0("graphing prognostics in ",i))
+  z <- subset(sel, sel$tumor == i)
+  k <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == i)
+  k <- k[,c(1,4,26,27)]
+  w <- subset(data$matrisome.data, data$matrisome.data$sample %in% k$sample)
+  for(j in unique(z$matrisome)){
+    print(paste0("selected gene: ",j))
+    w1 <- w[,colnames(w) %in% c("sample",j)]
+    w1 <- merge(w1,k,by="sample")
+    w1$group <- ifelse(w1[,2]>mean(w1[,2],na.rm = T),"hi","lo")
+    fit <- survfit(Surv(OS.time,OS)~group,data=w1)
+    p <- ggsurvplot(fit, pval = T) + ggtitle(paste0(i,"_",j))
+    print(p)
+  }
+}
+
+ntab2$id <- paste0(ntab2$tumor,"_",ntab2$matrisome)
+b <- res2[,c(3:5)]
+ntab2 <- merge(ntab2,b,by="id",all.x = T)
+ntab2$id <- NULL
+ntab2$surv.pval <- ifelse(is.na(ntab2$surv.pval)==T,"n.s.",ntab2$surv.pval)
+ntab2$eval <- ifelse(is.na(ntab2$eval)==T,"not prognostic",ntab2$eval)
+names(ntab2)[1] <- "tumor.type"
+names(ntab2)[2] <- "tumor.subtype"
+names(ntab2)[4] <- "regulator"
+names(ntab2)[5] <- "AUC"
+names(ntab2)[7] <- "selector"
+names(ntab2)[10] <- "survival p.value"
+names(ntab2)[11] <- "prognostic indicator"
+ntab2 <- as.data.frame(ntab2)
+
+fwrite(ntab2, "SUPPLEMENTARY TABLE 1.txt",sep="\t",row.names = F,quote= F)
+
+```
+
+Expression levels of matrisome landmarks vs. non landmarks.
+
+```{r eval = F}
+
+library(singscore)
+res <- list()
+for(i in unique(ntab2$tumor.subtype)){
+  print(paste0("testing tumor: ",i))
+  z <- subset(ntab2, ntab2$tumor.subtype == i)
+  s <- subset(data$clinical.data, data$clinical.data$Subtype_Selected == i)
+  k <- subset(data$matrisome.data, data$matrisome.data$sample %in% s$sample)
+  k <- t(k[,c(2:ncol(k))])
+  k <- rankGenes(k)
+  df <- data.frame(tumor=i,gene=rownames(k),meanrank=rowMeans(k))
+  df$meanrank <- nrow(k)-df$meanrank
+  df$meanrank.decs <- ifelse(df$meanrank <= 250,"1stQ","rest")
+  df$sel <- ifelse(df$gene %in% z$matrisome.gene,"landmark","no")
+  tab <- table(df$sel,df$meanrank.decs)
+  if(ncol(tab)==1){
+    df <- data.frame(tumor=i,diff.meanrank.1stQ=0)
+  }else{
+  x <- (tab[1,1]/tab[1,2])*100
+  y <- (tab[2,1]/tab[2,2])*100
+  if(x==0 & y==0){
+    df <- data.frame(tumor=i,diff.meanrank.1stQ=0)
+  }else{
+  df <- data.frame(tumor=i,diff.meanrank.1stQ=x/y)}}
+  res[[i]] <- df
+}
+res <- bind_rows(res)
+res$diff.meanrank.1stQ <- ifelse(res$diff.meanrank.1stQ == "Inf",100,res$diff.meanrank.1stQ)
+length(res$diff.meanrank.1stQ[res$diff.meanrank.1stQ > 0])
+res$x <- c(1:nrow(res))
+
+ggplot(res, aes(x=x, y=diff.meanrank.1stQ)) +
+  geom_segment( aes(x=x, xend=x, y=0, yend=diff.meanrank.1stQ), color="grey") +
+  geom_point(color=ifelse(res$diff.meanrank.1stQ>0,"orange","grey80"), size=2) +
+  scale_x_continuous(breaks = res$x, labels = res$tumor) +
+  xlab("") + ylab("Difference in rank (landmark vs. non landmark), 4th quartile") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90))
+
+sel2 <- unique((ntab2[,c(2,3)]))
+sel2$tumor.subtype <- gsub("\\..*","",sel2$tumor.subtype)
+sel2$cluster <- ifelse(sel2$tumor.subtype=="AML","blood",ifelse(sel2$tumor.subtype=="LIHC","liver",ifelse(sel2$tumor.subtype=="GBM_LGG"|sel2$tumor.subtype=="PCPG","neuroendocrine",ifelse(sel2$tumor.subtype=="HNSC"|sel2$tumor.subtype=="LUSC","squamous","adenomatous/sarcomatous"))))
+res <- list()
+for(i in unique(sel2$cluster)){
+  z <- subset(sel2, sel2$cluster ==i)
+  res[[i]] <- unique(z$matrisome.gene)
+}
+library(venn)
+venn(res, zcolor = "red, blue, green, yellow")
+
+```
+
+Cross-validation of matrisome landmarks at the protein level. Data are from The Human Protein Atlas (https://www.proteinatlas.org/), "Pathology data" table.
+
+```{r eval = F}
+
+setwd(dir.data)
+prots <- fread("pathology.tsv",sep="\t",header = T)
+prots <- prots[,c(2:7)]
+prots.conv <- data.frame(Cancer=unique(prots$Cancer))
+prots.conv$tumor.type <- c("BRCA","PCPG","UCECUCS","COADREAD","UCECUCS","GBMLGG","HNSC","LIHC","LUADLUSC","","SKCM","OV","","PRAD","KICHKIRCKIRP","","STAD","","THCA","")
+prots <- as.data.frame(prots)
+
+res <- list()
+res2 <- list()
+for(i in unique(ntab2$tumor.type)){
+  print(paste0("looking up proteins for tumor: ",i))
+  k <- i
+  if(i == "UCEC" | i == "UCS"){i <- "UCECUCS"}else{
+    if(i == "COAD" | i == "READ"){i <- "COADREAD"}else{
+      if(i == "GBM" | i == "LGG"){i <- "GBMLGG"}else{
+        if(i == "LUAD" | i == "LUSC"){i <- "LUADLUSC"}else{
+          if(i == "KICH" | i == "KIRP" | i == "KIRC"){i <- "KICHKIRCKIRP"}else{
+            i <- i}}}}}
+
+sel <- subset(prots.conv,prots.conv$tumor.type %in% i)
+if(nrow(sel)==0){
+  print("no evaluation possible, skipping to next tumor type")
+  next}else{
+    sel <- sel$Cancer
+    p <- subset(prots,prots$Cancer %in% sel)
+    z <- subset(ntab2, ntab2$tumor.type == k)
+    for(w in unique(z$matrisome.gene)){
+      if((w %in% p$`Gene name`) == FALSE){
+        print("gene-protein conversion failed!")
+        next}else{
+        p2 <- subset(p, p$`Gene name` %in% w)
+        res[[w]] <- data.frame(tumor.type=i,p2)
+        }}}
+res2[[i]] <- bind_rows(res)
+}
+res2 <- bind_rows(res2)
+res2 <- na.omit(res2)
+res2$eval <- apply(res2,1,function(x){sum(as.numeric(x[4]),as.numeric(x[5]))/sum(as.numeric(x[4]),as.numeric(x[5]),as.numeric(x[6]),as.numeric(x[7]))})
+res2$eval <- res2$eval*100
+res2 <- unique(res2)
+res2$eval2 <- apply(res2,1,function(x){sum(as.numeric(x[4]),as.numeric(x[5]),as.numeric(x[6]))/sum(as.numeric(x[4]),as.numeric(x[5]),as.numeric(x[6]),as.numeric(x[7]))})
+res2$eval2 <- res2$eval2*100
+res2$nz <- ifelse(res2$eval2 > 0,1,0)
+names(res2)[8] <- "percentage.high.or.medium"
+names(res2)[9] <- "percentage.non.zero"
+names(res2)[10] <- "is.non.zero"
+res2[,10] <- ifelse(res2[,10]==0,"no","yes")
+res2 <- res2[,c(1:7,9,8,10)]
+setwd(dir.res)
+fwrite(res2, "SUPPLEMENTARY TABLE 2.txt", sep="\t",row.names = F,quote = F)
+
+```
+
